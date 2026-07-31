@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Newer Glow
+Comment=RP2040 firmware updater
+Exec=NewerGlow
+Icon=NewerGlow
+Categories=Utility;
+Terminal=false

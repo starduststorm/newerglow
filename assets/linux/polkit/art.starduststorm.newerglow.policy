@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Newer Glow</vendor>
+  <vendor_url>https://starduststorm.art/</vendor_url>
+
+  <action id="art.starduststorm.newerglow.install-udev">
+    <description>Set up USB device access for RP2040 devices</description>
+    <message>Newer Glow needs to set up USB device access.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

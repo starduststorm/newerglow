@@ -1,0 +1,93 @@
+[package]
+name = "newerglow"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform firmware updater for starduststorm USB devices"
+
+[features]
+default = ["cli", "ui"]
+cli = ["dep:clap", "dep:dialoguer", "dep:indicatif"]
+ui = [
+    "dep:eframe",
+    "dep:egui_extras",
+    "dep:ureq",
+    "dep:native-tls",
+    "dep:rfd",
+    "dep:image",
+    "dep:globset",
+    "dep:tobj",
+    "dep:glam",
+    "dep:bytemuck",
+    "dep:sha2",
+]
+# Pulls in `pollster` for the `bake-static-images` dev tool. Not needed
+# at runtime — the baked PNGs are committed to the repo and included via
+# include_bytes! in the main UI binary.
+bake = ["ui", "dep:pollster"]
+
+[dependencies]
+# Core (always needed by lib)
+serialport = "4"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+# The board registry parses board.toml and resolves the user boards dir
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dirs = "5"
+
+# CLI-only
+clap = { version = "4", features = ["derive"], optional = true }
+dialoguer = { version = "0.11", optional = true }
+indicatif = { version = "0.17", optional = true }
+
+# UI-only
+# eframe with the wgpu renderer instead of glow: macOS binds Metal,
+# Windows DX12 (Vulkan fallback), Linux Vulkan (GLES fallback). The
+# `wayland`/`x11` features are unrelated to the renderer and required
+# for winit window creation on Linux.
+eframe = { version = "0.28", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "wayland", "x11"], optional = true }
+egui_extras = { version = "0.28", features = ["image"], optional = true }
+ureq = { version = "2", default-features = false, features = ["json", "native-tls"], optional = true }
+native-tls = { version = "0.2", optional = true }
+rfd = { version = "0.14", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+globset = { version = "0.4", optional = true }
+tobj = { version = "4", default-features = false, optional = true }
+glam = { version = "0.27", default-features = false, features = ["std"], optional = true }
+bytemuck = { version = "1", optional = true }
+# SHA-256 verification of downloaded firmware against GitHub's asset digest.
+sha2 = { version = "0.10", optional = true }
+pollster = { version = "0.3", optional = true }
+
+[build-dependencies]
+# build.rs syntax-checks each board.toml so a typo fails the build, naming
+# the file. The typed schema check lives in src/boards.rs's tests.
+toml = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# geteuid() for the in-binary pkexec re-exec in src/install_udev.rs.
+libc = "0.2"
+
+[[bin]]
+name = "newerglow-cli"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "NewerGlow"
+path = "src/bin/ui.rs"
+required-features = ["ui"]
+
+[[bin]]
+name = "bake-static-images"
+path = "src/bin/bake_static_images.rs"
+required-features = ["bake"]
+
+[profile.release]
+lto = true
+strip = true
+# Note: opt-level = "z" (size) is roughly 10× slower than 3 (speed) for
+# egui's tessellation hot path. We pay a few MB of binary size for fluid
+# 60 fps animation when the 3D model is on screen.
+opt-level = 3

@@ -1,0 +1,6 @@
+# Placeholder MTL companion for motionhexa.obj.
+# When a real material library is dropped in here (with `Kd` diffuse
+# entries matched by `usemtl` directives in the OBJ), per-mesh colors
+# will be picked up automatically by the wgpu renderer in src/ui/model.rs.
+# Until then, the renderer falls back to its built-in default color
+# for every mesh group, matching the prior single-color behavior.

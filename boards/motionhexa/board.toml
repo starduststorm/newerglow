@@ -1,0 +1,12 @@
+display_name = "motionhexa"
+
+[identity]
+prefix = "motionhexa"
+usb_vid = [0x2E8A]
+usb_pid = []
+
+[firmware]
+github_owner = "starduststorm"
+github_repo = "motionhexa"
+asset_pattern = "*.uf2"
+tag_prefix = "fw-v"
