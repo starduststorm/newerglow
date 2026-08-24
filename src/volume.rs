@@ -1,6 +1,9 @@
 use crate::error::UpdateError;
 use log::debug;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+// Only `accept_volume` takes a &Path, and that's Unix-only.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Bootloader mass-storage volume labels we accept. The RP2040 UF2
@@ -10,6 +13,10 @@ const VOLUME_LABELS: &[&str] = &["RPI-RP2", "RP2350"];
 
 /// Accept `path` only if it is a real directory (not a symlink that could
 /// redirect the flash) whose basename is a known bootloader label.
+///
+/// Unix only: Windows enumerates drive letters and reads each label through
+/// `GetVolumeInformationW`, so it has no mount-point path to validate.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn accept_volume(path: &Path) -> bool {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return false;

@@ -69,6 +69,12 @@ toml = "0.8"
 # geteuid() for the in-binary pkexec re-exec in src/install_udev.rs.
 libc = "0.2"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+# GetVolumeInformationW for the drive-letter scan in src/volume.rs. Pinned to
+# the 0.59 line because that's what the dependency tree already pulls in —
+# a different major would compile a second copy of the whole crate.
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
 [[bin]]
 name = "newerglow-cli"
 path = "src/main.rs"

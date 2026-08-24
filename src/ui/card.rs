@@ -316,7 +316,7 @@ fn draw_image_placeholder(
         rect,
         6.0,
         ui.visuals().faint_bg_color,
-        egui::Stroke::new(1.0, ui.visuals().weak_text_color()),
+        egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
     );
 
     // Fit the trident inside ~50% of the placeholder's smaller dimension,
