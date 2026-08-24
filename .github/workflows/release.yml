@@ -1,0 +1,257 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both macOS legs build on macos-14 (Apple Silicon). The x86_64
+          # target is cross-compiled there — the dtolnay toolchain action
+          # installs the target and the macOS SDK ships both arch slices —
+          # so we don't depend on the deprecated macos-13 (Intel) runner.
+          - os: macos-14
+            target: x86_64-apple-darwin
+            slug: macos-x64
+          - os: macos-14
+            target: aarch64-apple-darwin
+            slug: macos-arm64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            slug: linux-x64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            slug: windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libudev-dev \
+            libgtk-3-dev \
+            libxkbcommon-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev \
+            libssl-dev \
+            libgl1-mesa-dev \
+            libvulkan-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Builds both binaries. The CLI (`newerglow-cli`) is built so it doesn't
+      # bitrot, but only the GUI binary is staged for upload.
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage UI binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/NewerGlow dist/NewerGlow-${{ matrix.slug }}
+          chmod +x dist/NewerGlow-${{ matrix.slug }}
+
+      - name: Stage UI binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/NewerGlow.exe dist/NewerGlow-${{ matrix.slug }}.exe
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.slug }}
+          path: dist/*
+          if-no-files-found: error
+
+  package-macos-dmg:
+    name: macOS .dmg (universal)
+    runs-on: macos-14
+    needs: build-binaries
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-macos-x64
+          path: bin-x64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-macos-arm64
+          path: bin-arm64
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          VERSION=$(grep -E '^version\s*=\s*"' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version: $VERSION"
+
+      - name: lipo universal binary
+        run: |
+          mkdir -p dist
+          lipo -create -output dist/NewerGlow-universal \
+            bin-x64/NewerGlow-macos-x64 \
+            bin-arm64/NewerGlow-macos-arm64
+          chmod +x dist/NewerGlow-universal
+
+      - name: Assemble .app bundle
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          APP="dist/Newer Glow.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp dist/NewerGlow-universal "$APP/Contents/MacOS/Newer Glow"
+          chmod +x "$APP/Contents/MacOS/Newer Glow"
+          cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+          sed "s/__VERSION__/${VERSION}/g" assets/Info.plist > "$APP/Contents/Info.plist"
+
+      # note: no code signing is configured yet — no Developer ID identity
+      # exists for this project, so the .app and .dmg ship unsigned and
+      # Gatekeeper quarantines them on first launch (the README tells users to
+      # right-click -> Open). When an identity is available, reinstate a
+      # certificate-import step plus a codesign pass over the .app before
+      # hdiutil and over the .dmg after it.
+      - name: Build .dmg
+        run: |
+          STAGING="$RUNNER_TEMP/dmg-staging"
+          mkdir -p "$STAGING"
+          cp -R "dist/Newer Glow.app" "$STAGING/"
+          ln -s /Applications "$STAGING/Applications"
+          hdiutil create \
+            -volname "Newer Glow" \
+            -srcfolder "$STAGING" \
+            -ov \
+            -format UDZO \
+            "dist/NewerGlow-macos-universal.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-macos-dmg
+          path: dist/NewerGlow-macos-universal.dmg
+          if-no-files-found: error
+
+  package-linux-appimage:
+    name: Linux AppImage
+    runs-on: ubuntu-22.04
+    needs: build-binaries
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-linux-x64
+          path: bin
+
+      - name: Stage AppDir
+        run: |
+          APPDIR=AppDir
+          mkdir -p \
+            "$APPDIR/usr/bin" \
+            "$APPDIR/usr/share/applications" \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp bin/NewerGlow-linux-x64 "$APPDIR/usr/bin/NewerGlow"
+          chmod +x "$APPDIR/usr/bin/NewerGlow"
+          cp assets/NewerGlow.desktop "$APPDIR/usr/share/applications/"
+          cp assets/AppIcon.iconset/icon_256x256.png \
+             "$APPDIR/usr/share/icons/hicolor/256x256/apps/NewerGlow.png"
+
+      - name: Download linuxdeploy
+        run: |
+          mkdir -p tools
+          curl -fsSL -o tools/linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL -o tools/linuxdeploy-plugin-appimage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
+          chmod +x tools/linuxdeploy tools/linuxdeploy-plugin-appimage
+
+      # GitHub's Ubuntu 22.04 image dropped libfuse2 by default; AppImage
+      # tools need either fuse2 installed or to be told to self-extract.
+      # APPIMAGE_EXTRACT_AND_RUN avoids the apt dependency entirely.
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+          OUTPUT: NewerGlow-x86_64.AppImage
+        run: |
+          mkdir -p dist
+          PATH="$PWD/tools:$PATH" \
+            tools/linuxdeploy --appdir AppDir --output appimage
+          mv NewerGlow-x86_64.AppImage dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-linux-appimage
+          path: dist/NewerGlow-x86_64.AppImage
+          if-no-files-found: error
+
+  package-windows-zip:
+    name: Windows portable .zip
+    runs-on: windows-latest
+    needs: build-binaries
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bin-windows-x64
+          path: bin
+
+      - name: Build zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $staging = Join-Path $env:RUNNER_TEMP "zip-staging"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item bin/NewerGlow-windows-x64.exe (Join-Path $staging "Newer Glow.exe")
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath dist/NewerGlow-windows-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-windows-zip
+          path: dist/NewerGlow-windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    runs-on: ubuntu-22.04
+    needs: [package-macos-dmg, package-linux-appimage, package-windows-zip]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: pkg-*
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la artifacts/
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
