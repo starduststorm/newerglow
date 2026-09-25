@@ -163,12 +163,24 @@ pub struct App {
     /// Wall-clock origin for model rotation animation.
     start_time: Instant,
     /// Rolling-average FPS guard: when sustained CPU/GPU pressure makes
-    /// the live rotation drop below 24 fps, latch into static fallback
-    /// for the rest of the session.
+    /// the live rotation drop below 24 fps, step `model_quality` down one
+    /// tier for the rest of the session.
     frame_intervals_ns: std::collections::VecDeque<u64>,
     last_frame_time: Option<Instant>,
     slow_frame_streak: u32,
-    use_static_fallback: bool,
+    model_quality: ModelQuality,
+}
+
+/// How device cards draw their board model, best first. The FPS guard only
+/// ever moves down this list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelQuality {
+    /// Live 3D, rendered offscreen at 4× MSAA.
+    Antialiased,
+    /// Live 3D, drawn straight into egui's single-sampled pass.
+    Aliased,
+    /// Baked `model.png`.
+    Static,
 }
 
 /// Load a pre-rendered RGBA PNG (e.g. a baked static fallback image
@@ -262,6 +274,15 @@ impl App {
         let mut static_textures: HashMap<String, egui::TextureHandle> = HashMap::new();
         let mut board_icons: HashMap<String, egui::TextureHandle> = HashMap::new();
         let depth_format = eframe::wgpu::TextureFormat::Depth32Float;
+        let antialias = cc.wgpu_render_state.as_ref().is_some_and(|rs| {
+            let supports = |f| {
+                rs.adapter
+                    .get_texture_format_features(f)
+                    .flags
+                    .sample_count_supported(4)
+            };
+            supports(rs.target_format) && supports(depth_format)
+        });
         for board in registry.boards() {
             let assets = board_assets::load(board);
 
@@ -274,6 +295,7 @@ impl App {
                     &rs.device,
                     rs.target_format,
                     depth_format,
+                    antialias,
                     obj,
                     assets.model_mtl.as_deref().unwrap_or(&[]),
                 ) {
@@ -307,8 +329,14 @@ impl App {
         //     where the live renderer happens to be fast enough.
         let force_fallback = std::env::var("NEWERGLOW_FORCE_FALLBACK")
             .is_ok_and(|v| v == "1");
-        let use_static_fallback =
-            force_fallback || (models.is_empty() && !static_textures.is_empty());
+        let model_quality = if force_fallback || (models.is_empty() && !static_textures.is_empty()) {
+            ModelQuality::Static
+        } else if antialias {
+            ModelQuality::Antialiased
+        } else {
+            ModelQuality::Aliased
+        };
+        log::info!("model quality: {:?}", model_quality);
 
         Self {
             registry,
@@ -329,7 +357,7 @@ impl App {
             frame_intervals_ns: std::collections::VecDeque::with_capacity(64),
             last_frame_time: None,
             slow_frame_streak: 0,
-            use_static_fallback,
+            model_quality,
         }
     }
 
@@ -582,8 +610,9 @@ impl eframe::App for App {
 impl App {
     /// Track frame intervals while the live 3D path is active. After a
     /// short warmup, if the rolling 60-frame average drops under 24 fps
-    /// for 90 consecutive frames (~1.5 s), latch into static fallback
-    /// for the rest of the session and stop driving the repaint timer.
+    /// for 90 consecutive frames (~1.5 s), step down one `ModelQuality`
+    /// tier and start measuring afresh. Reaching `Static` stops driving
+    /// the repaint timer.
     fn observe_frame_interval(&mut self) {
         const WINDOW: usize = 60;
         const WARMUP: usize = 30;
@@ -614,14 +643,23 @@ impl App {
 
         if avg_fps < SLOW_THRESHOLD_FPS {
             self.slow_frame_streak += 1;
-            if self.slow_frame_streak >= SLOW_STREAK_TO_LATCH && !self.use_static_fallback {
+            if self.slow_frame_streak >= SLOW_STREAK_TO_LATCH {
+                let next = match self.model_quality {
+                    ModelQuality::Antialiased => ModelQuality::Aliased,
+                    ModelQuality::Aliased | ModelQuality::Static => ModelQuality::Static,
+                };
                 log::info!(
-                    "live 3D below {} fps for {} frames (avg {:.1}); switching to static fallback",
+                    "live 3D below {} fps for {} frames (avg {:.1}); {:?} -> {:?}",
                     SLOW_THRESHOLD_FPS,
                     self.slow_frame_streak,
                     avg_fps,
+                    self.model_quality,
+                    next,
                 );
-                self.use_static_fallback = true;
+                self.model_quality = next;
+                self.frame_intervals_ns.clear();
+                self.last_frame_time = None;
+                self.slow_frame_streak = 0;
             }
         } else {
             self.slow_frame_streak = 0;
@@ -635,7 +673,7 @@ impl App {
     /// session-wide fallback latch hasn't engaged). Used to gate the
     /// rotation-animation repaint timer.
     fn any_visible_live_model(&self) -> bool {
-        if self.use_static_fallback {
+        if self.model_quality == ModelQuality::Static {
             return false;
         }
         self.devices.iter().any(|d| {
@@ -730,7 +768,7 @@ impl App {
         ui.horizontal_top(|ui| {
             let count = self.devices.len();
             let elapsed_secs = self.start_time.elapsed().as_secs_f32();
-            let in_fallback = self.use_static_fallback;
+            let quality = self.model_quality;
             let registry = self.registry.clone();
             for i in 0..count {
                 let overlay = self.overlay_for(i, updating_port);
@@ -738,7 +776,7 @@ impl App {
                 // When the session-wide fallback latch is engaged, never
                 // hand a live model to the card — it'll fall through to
                 // the static texture (if any) or the USB placeholder.
-                let model = if in_fallback {
+                let model = if quality == ModelQuality::Static {
                     None
                 } else {
                     bid.and_then(|b| self.models.get(b)).cloned()
@@ -757,6 +795,7 @@ impl App {
                     external_link_hover_tex: &self.external_link_hover_tex,
                     usb_icon_tex: &self.usb_icon_tex,
                     model,
+                    antialias: quality == ModelQuality::Antialiased,
                     static_texture,
                     icon_texture,
                     elapsed_secs,

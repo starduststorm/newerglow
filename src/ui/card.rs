@@ -3,7 +3,7 @@ use eframe::egui;
 use crate::boards::Registry;
 use crate::boards::HW_PLACEHOLDER;
 use crate::ui::app::{self, BoardReleases, DeviceCard, FirmwareSelection, ReleaseLibrary};
-use crate::ui::model::SharedModel;
+use crate::ui::model::{AntialiasTarget, SharedModel};
 use crate::ui::workers::UpdatePhase;
 use crate::ui::{CARD_WIDTH, IMAGE_HEIGHT, IMAGE_SIDE};
 
@@ -55,6 +55,9 @@ pub struct DrawContext<'a> {
     /// board ships no model or when the session-wide fallback latch has
     /// engaged because the live path can't sustain ≥24 fps.
     pub model: Option<SharedModel>,
+    /// Render `model` through the 4× MSAA path. Cleared by the FPS guard
+    /// before it gives up on the live model entirely.
+    pub antialias: bool,
     /// Pre-rendered static fallback image for the device's matched board.
     /// Used in place of the live 3D paint callback when `model` is `None`
     /// but the board ships a baked PNG.
@@ -226,16 +229,22 @@ const MODEL_ANGULAR_SPEED: f32 = std::f32::consts::TAU / 16.0;
 struct ModelPaintCb {
     model: SharedModel,
     angle: f32,
+    antialias: bool,
 }
+
+/// Offscreen MSAA targets, keyed by `SharedModel` pointer, kept in egui's
+/// callback resources so `paint` can borrow them for the render pass.
+#[derive(Default)]
+struct AntialiasTargets(std::collections::HashMap<usize, AntialiasTarget>);
 
 impl eframe::egui_wgpu::CallbackTrait for ModelPaintCb {
     fn prepare(
         &self,
-        _device: &eframe::wgpu::Device,
+        device: &eframe::wgpu::Device,
         queue: &eframe::wgpu::Queue,
         screen: &eframe::egui_wgpu::ScreenDescriptor,
-        _encoder: &mut eframe::wgpu::CommandEncoder,
-        _resources: &mut eframe::egui_wgpu::CallbackResources,
+        encoder: &mut eframe::wgpu::CommandEncoder,
+        resources: &mut eframe::egui_wgpu::CallbackResources,
     ) -> Vec<eframe::wgpu::CommandBuffer> {
         // `prepare` sees only the screen descriptor, not the callback rect,
         // so compute the aspect from the card image area — it matches what
@@ -244,6 +253,29 @@ impl eframe::egui_wgpu::CallbackTrait for ModelPaintCb {
         let w = IMAGE_SIDE * ppp;
         let h = IMAGE_HEIGHT * ppp;
         self.model.prepare(queue, w, h, self.angle);
+
+        let key = std::sync::Arc::as_ptr(&self.model) as usize;
+        if !(self.antialias && self.model.supports_antialias()) {
+            // Free the offscreen attachments once the FPS guard has
+            // dropped this session out of the antialiased tier.
+            if let Some(targets) = resources.get_mut::<AntialiasTargets>() {
+                targets.0.remove(&key);
+            }
+            return Vec::new();
+        }
+        if resources.get::<AntialiasTargets>().is_none() {
+            resources.insert(AntialiasTargets::default());
+        }
+        let targets = &mut resources.get_mut::<AntialiasTargets>().expect("just inserted").0;
+        let size = (w.round() as u32, h.round() as u32);
+        if targets.get(&key).map(AntialiasTarget::size) != Some(size) {
+            if let Some(t) = self.model.antialias_target(device, size) {
+                targets.insert(key, t);
+            }
+        }
+        if let Some(target) = targets.get(&key) {
+            self.model.render_antialiased(encoder, target);
+        }
         Vec::new()
     }
 
@@ -251,7 +283,7 @@ impl eframe::egui_wgpu::CallbackTrait for ModelPaintCb {
         &'a self,
         info: egui::PaintCallbackInfo,
         render_pass: &mut eframe::wgpu::RenderPass<'a>,
-        _resources: &'a eframe::egui_wgpu::CallbackResources,
+        resources: &'a eframe::egui_wgpu::CallbackResources,
     ) {
         let v = info.viewport_in_pixels();
         let scissor = (
@@ -260,7 +292,15 @@ impl eframe::egui_wgpu::CallbackTrait for ModelPaintCb {
             v.width_px.max(0) as u32,
             v.height_px.max(0) as u32,
         );
-        self.model.paint(render_pass, scissor);
+        let target = resources
+            .get::<AntialiasTargets>()
+            .and_then(|t| t.0.get(&(std::sync::Arc::as_ptr(&self.model) as usize)));
+        match target {
+            Some(target) if self.antialias => {
+                self.model.paint_antialiased(render_pass, target, scissor)
+            }
+            _ => self.model.paint(render_pass, scissor),
+        }
     }
 }
 
@@ -281,6 +321,7 @@ fn draw_image_or_model(ui: &mut egui::Ui, ctx: &DrawContext) {
         let cb = ModelPaintCb {
             model: model.clone(),
             angle: ctx.elapsed_secs * MODEL_ANGULAR_SPEED,
+            antialias: ctx.antialias,
         };
         ui.painter().add(eframe::egui_wgpu::Callback::new_paint_callback(
             rect, cb,
@@ -480,8 +521,9 @@ fn github_url_for_device(ctx: &DrawContext) -> Option<String> {
     Some(board.releases_page_url())
 }
 
-/// Dropdown showing either the matched board's releases or, when
-/// unmatched, every board's releases grouped by disabled section header.
+/// Dropdown showing the matched board's releases, nothing for an identified
+/// device no board matches, or, when unidentified, every board's releases
+/// grouped by disabled section header.
 fn draw_dropdown(ui: &mut egui::Ui, ctx: &DrawContext, width: f32) -> Action {
     let mut action = Action::None;
     let device = ctx.device;
@@ -519,6 +561,7 @@ fn draw_dropdown(ui: &mut egui::Ui, ctx: &DrawContext, width: f32) -> Action {
                 Some(BoardReleases::Failed(e)) => format!("⚠ {}", short_err(e)),
                 None => "—".to_string(),
             },
+            None if device.identity.is_some() => "No firmware".to_string(),
             None => "Pick firmware…".to_string(),
         },
     };
@@ -542,9 +585,15 @@ fn draw_dropdown(ui: &mut egui::Ui, ctx: &DrawContext, width: f32) -> Action {
                 ui.separator();
             }
 
+            // note: only an unidentified device may pick from every board. One
+            // that identifies as a product no board claims gets nothing, since
+            // any listed firmware would be for a different project.
             match &device.matched_board {
                 Some(matched_id) => {
                     draw_board_entries(ui, ctx, matched_id, false, &mut action);
+                }
+                None if device.identity.is_some() => {
+                    ui.add_enabled(false, egui::Label::new("(no firmware for this device)"));
                 }
                 None => {
                     for (i, board) in ctx.registry.boards().iter().enumerate() {

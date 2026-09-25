@@ -10,6 +10,13 @@
 //! `encodeAndEmitRenderState` cycle on the CPU side. Splitting by
 //! material would multiply that fixed cost by the material count for no
 //! visual benefit since the material set is tiny and well-separated.
+//!
+//! Two ways to get pixels on screen: `paint` draws straight into egui's
+//! (single-sampled) render pass, while `render_antialiased` +
+//! `paint_antialiased` render 4× MSAA offscreen and composite the resolved
+//! image. egui's pass can't be multisampled per-callback or toggled at
+//! runtime, hence the offscreen detour — which is what lets the app drop
+//! back to the direct path when a machine can't keep up.
 
 use eframe::wgpu;
 use std::sync::Arc;
@@ -56,6 +63,35 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Fullscreen-triangle composite of the resolved offscreen image into the
+/// callback's viewport. The resolve leaves edge pixels premultiplied
+/// against the transparent clear, so the pipeline blends premultiplied.
+const BLIT_SHADER_SRC: &str = r#"
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+    let uv = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));
+    var out: VsOut;
+    out.pos = vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, in.uv);
+}
+"#;
+
+const MSAA_SAMPLES: u32 = 4;
+
 /// Per-frame transforms — the only uniform written per frame.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -67,6 +103,8 @@ struct Transforms {
 
 pub struct ModelRenderer {
     pipeline: wgpu::RenderPipeline,
+    /// Present only when built with `antialias`.
+    antialias: Option<Antialias>,
     vertex_buffer: wgpu::Buffer,
     index_buffer: wgpu::Buffer,
     /// Single shared per-frame transforms buffer. Updated by `prepare()`
@@ -83,14 +121,44 @@ pub struct ModelRenderer {
     light_dir: glam::Vec3,
 }
 
+struct Antialias {
+    /// Same shading as `ModelRenderer::pipeline`, at `MSAA_SAMPLES`.
+    pipeline: wgpu::RenderPipeline,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    target_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
+}
+
+/// Offscreen attachments for one antialiased render at a fixed pixel size.
+pub struct AntialiasTarget {
+    size: (u32, u32),
+    color: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    /// Single-sampled resolve of `color`, in the renderer's target format.
+    pub resolved: wgpu::Texture,
+    resolved_view: wgpu::TextureView,
+    blit_bind_group: wgpu::BindGroup,
+}
+
+impl AntialiasTarget {
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+}
+
 impl ModelRenderer {
     /// Parse OBJ + (optional) MTL bytes and build the GPU resources: an
     /// interleaved vertex buffer (position + normal + color), index buffer,
-    /// pipeline, and the per-frame transform bind group.
+    /// pipeline, and the per-frame transform bind group. `antialias` also
+    /// builds the 4× MSAA path; the caller must have checked that
+    /// `target_format` supports 4× multisampling.
     pub fn from_obj_bytes(
         device: &wgpu::Device,
         target_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
+        antialias: bool,
         obj_bytes: &[u8],
         mtl_bytes: &[u8],
     ) -> Result<Self, String> {
@@ -143,7 +211,7 @@ impl ModelRenderer {
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(SHADER_SRC)),
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let make_pipeline = |sample_count: u32| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("model.pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
@@ -188,7 +256,10 @@ impl ModelRenderer {
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
@@ -200,6 +271,10 @@ impl ModelRenderer {
                 })],
             }),
             multiview: None,
+        });
+        let pipeline = make_pipeline(1);
+        let antialias = antialias.then(|| {
+            build_antialias(device, make_pipeline(MSAA_SAMPLES), target_format, depth_format)
         });
 
         // Single shared transform UBO — written once per frame in prepare().
@@ -228,6 +303,7 @@ impl ModelRenderer {
 
         Ok(Self {
             pipeline,
+            antialias,
             vertex_buffer,
             index_buffer,
             transform_buffer,
@@ -286,6 +362,204 @@ impl ModelRenderer {
         render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
         render_pass.set_bind_group(0, &self.bind_group, &[]);
         render_pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+
+    pub fn supports_antialias(&self) -> bool {
+        self.antialias.is_some()
+    }
+
+    /// Allocate offscreen attachments for `render_antialiased` at `size`
+    /// physical pixels. `None` when built without `antialias`.
+    pub fn antialias_target(&self, device: &wgpu::Device, size: (u32, u32)) -> Option<AntialiasTarget> {
+        let aa = self.antialias.as_ref()?;
+        let (w, h) = (size.0.max(1), size.1.max(1));
+        let texture = |label, samples, format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let view = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+        let color = texture("model.aa.color", MSAA_SAMPLES, aa.target_format, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth = texture("model.aa.depth", MSAA_SAMPLES, aa.depth_format, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let resolved = texture(
+            "model.aa.resolved",
+            1,
+            aa.target_format,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+        );
+        let resolved_view = view(&resolved);
+        let blit_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("model.aa.blit_bind_group"),
+            layout: &aa.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&resolved_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&aa.sampler),
+                },
+            ],
+        });
+        Some(AntialiasTarget {
+            size: (w, h),
+            color: view(&color),
+            depth: view(&depth),
+            resolved,
+            resolved_view,
+            blit_bind_group,
+        })
+    }
+
+    /// Record a 4× MSAA render of the model into `target`, resolved into
+    /// `target.resolved` over a transparent background. Uses the
+    /// transforms from the last `prepare()`.
+    pub fn render_antialiased(&self, encoder: &mut wgpu::CommandEncoder, target: &AntialiasTarget) {
+        let Some(aa) = self.antialias.as_ref() else {
+            return;
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("model.aa.pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.color,
+                resolve_target: Some(&target.resolved_view),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Discard,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &target.depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&aa.pipeline);
+        pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+        pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw_indexed(0..self.index_count, 0, 0..1);
+    }
+
+    /// Composite `target`'s resolved image into the egui render pass,
+    /// filling the viewport egui set for the callback. `scissor` as in
+    /// `paint`.
+    pub fn paint_antialiased<'rp>(
+        &'rp self,
+        render_pass: &mut wgpu::RenderPass<'rp>,
+        target: &'rp AntialiasTarget,
+        scissor: (u32, u32, u32, u32),
+    ) {
+        let Some(aa) = self.antialias.as_ref() else {
+            return;
+        };
+        let (sx, sy, sw, sh) = scissor;
+        if sw == 0 || sh == 0 {
+            return;
+        }
+        render_pass.set_scissor_rect(sx, sy, sw, sh);
+        render_pass.set_pipeline(&aa.blit_pipeline);
+        render_pass.set_bind_group(0, &target.blit_bind_group, &[]);
+        render_pass.draw(0..3, 0..1);
+    }
+}
+
+fn build_antialias(
+    device: &wgpu::Device,
+    pipeline: wgpu::RenderPipeline,
+    target_format: wgpu::TextureFormat,
+    depth_format: wgpu::TextureFormat,
+) -> Antialias {
+    let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("model.aa.blit_bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("model.aa.blit_layout"),
+        bind_group_layouts: &[&blit_layout],
+        push_constant_ranges: &[],
+    });
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("model.aa.blit_shader"),
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(BLIT_SHADER_SRC)),
+    });
+    let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("model.aa.blit"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        // egui's pass carries a depth attachment (depth_buffer = 32), so the
+        // pipeline must declare a matching one even though it ignores depth.
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: depth_format,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target_format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview: None,
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("model.aa.sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    Antialias {
+        pipeline,
+        blit_pipeline,
+        blit_layout,
+        sampler,
+        target_format,
+        depth_format,
     }
 }
 

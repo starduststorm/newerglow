@@ -98,8 +98,8 @@ fn locate_repo_root() -> Option<PathBuf> {
 }
 
 /// Render `obj_bytes` (paired with `mtl_bytes`) headlessly into a PNG
-/// byte buffer. The render target is sRGB Rgba8 with a transparent
-/// clear color so the model can be composited over arbitrary card
+/// byte buffer, through the same 4× MSAA path as the live card. The
+/// render target is sRGB Rgba8 with a transparent clear color so the model can be composited over arbitrary card
 /// backgrounds at runtime.
 fn render_one(
     device: &wgpu::Device,
@@ -109,40 +109,17 @@ fn render_one(
 ) -> Result<Vec<u8>, String> {
     let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let depth_format = wgpu::TextureFormat::Depth32Float;
-    let renderer =
-        ModelRenderer::from_obj_bytes(device, target_format, depth_format, obj_bytes, mtl_bytes)?;
-
-    let color_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("bake.color"),
-        size: wgpu::Extent3d {
-            width: OUT_W,
-            height: OUT_H,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: target_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let color_view = color_tex.create_view(&wgpu::TextureViewDescriptor::default());
-
-    let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("bake.depth"),
-        size: wgpu::Extent3d {
-            width: OUT_W,
-            height: OUT_H,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: depth_format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-        view_formats: &[],
-    });
-    let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let renderer = ModelRenderer::from_obj_bytes(
+        device,
+        target_format,
+        depth_format,
+        true,
+        obj_bytes,
+        mtl_bytes,
+    )?;
+    let target = renderer
+        .antialias_target(device, (OUT_W, OUT_H))
+        .ok_or("antialiasing unavailable")?;
 
     // wgpu requires copy_texture_to_buffer source rows to be padded to
     // wgpu::COPY_BYTES_PER_ROW_ALIGNMENT (256). We strip the padding
@@ -160,33 +137,10 @@ fn render_one(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("bake.encoder"),
     });
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("bake.pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &color_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Discard,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        renderer.paint(&mut pass, (0, 0, OUT_W, OUT_H));
-    }
+    renderer.render_antialiased(&mut encoder, &target);
     encoder.copy_texture_to_buffer(
         wgpu::ImageCopyTexture {
-            texture: &color_tex,
+            texture: &target.resolved,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
