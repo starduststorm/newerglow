@@ -1,6 +1,7 @@
 //! IDENTIFY response parser.
 //!
-//! The firmware-side library `RP2040Updater` emits responses of the form:
+//! dustlib's `NewerGlowUpdater` emits responses of the form (see
+//! `doc/firmware-release-contract.md`):
 //!
 //! ```text
 //! ID:<product> v<fw_version>[ hw=<hw_version>][ sn=<board_id>]
@@ -54,11 +55,21 @@ mod tests {
 
     #[test]
     fn parses_full_identity() {
-        let id = ParsedIdentity::parse("motionhexa v0.9.0 hw=v5 sn=DEADBEEF");
+        let id = ParsedIdentity::parse("motionhexa v0.9.0 hw=5 sn=DEADBEEF");
         assert_eq!(id.product, "motionhexa");
         assert_eq!(id.fw_version.as_deref(), Some("0.9.0"));
-        assert_eq!(id.hw_version.as_deref(), Some("v5"));
+        assert_eq!(id.hw_version.as_deref(), Some("5"));
         assert_eq!(id.serial_number.as_deref(), Some("DEADBEEF"));
+    }
+
+    #[test]
+    fn parses_untagged_dev_build() {
+        // Verbatim from a penta built outside a release tag.
+        let id = ParsedIdentity::parse("penta v0.0.0+g0776467.dirty hw=2 sn=374796340604105F");
+        assert_eq!(id.product, "penta");
+        assert_eq!(id.fw_version.as_deref(), Some("0.0.0+g0776467.dirty"));
+        assert_eq!(id.hw_version.as_deref(), Some("2"));
+        assert_eq!(id.serial_number.as_deref(), Some("374796340604105F"));
     }
 
     #[test]

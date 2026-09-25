@@ -36,8 +36,9 @@ usb_pid = []
 [firmware]
 github_owner = "starduststorm"
 github_repo = "motionhexa"
-# Glob matched against release asset names.
-asset_pattern = "*.uf2"
+# Glob matched against release asset names. `{hw}` (at most once) stands
+# for the device's hardware revision; see "Firmware per hardware revision".
+asset_pattern = "motionhexa-*-hw{hw}.uf2"
 # Release tags must start with this; the rest (minus one optional leading
 # `v`) is the version. Tags that don't match are dropped from the list.
 # Empty accepts both `v1.2.3` and `1.2.3`.
@@ -46,6 +47,25 @@ tag_prefix = "fw-v"
 
 Unknown keys are rejected, so a typo fails loudly rather than silently
 defaulting.
+
+## Firmware per hardware revision
+
+When one repo releases different images for different board revisions, put
+`{hw}` in `asset_pattern`. The app substitutes the revision from the device's
+IDENTIFY reply (`hw=7`). A release is offered to a device only when it has
+an asset for that revision, and **Auto** picks the newest such release. A
+device whose revision is unknown gets no automatic pick. Its dropdown lists
+every revision's asset (`fw-v1.3 · hw 7`) and the user chooses.
+
+Whatever gets picked, the flash step checks the UF2's family id against the
+mounted bootloader (RP2040 or RP2350) and refuses a mismatch before writing.
+
+A pattern without `{hw}` keeps the simple behavior: the first matching asset
+of each release.
+
+The firmware side of this (IDENTIFY format, tag-derived versions, the shared
+release workflow) is specified in
+[`doc/firmware-release-contract.md`](../doc/firmware-release-contract.md).
 
 ## Card image
 

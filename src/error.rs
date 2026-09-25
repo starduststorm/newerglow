@@ -35,6 +35,9 @@ pub enum UpdateError {
     #[error("not a valid UF2 firmware file (bad size or missing UF2 signature)")]
     FirmwareInvalid,
 
+    #[error("this firmware is built for {firmware} but the device is an {chip}; pick the build for this hardware")]
+    WrongChip { firmware: String, chip: &'static str },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 

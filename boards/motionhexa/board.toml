@@ -8,5 +8,5 @@ usb_pid = []
 [firmware]
 github_owner = "starduststorm"
 github_repo = "motionhexa"
-asset_pattern = "*.uf2"
+asset_pattern = "motionhexa-*-hw{hw}.uf2"
 tag_prefix = "fw-v"

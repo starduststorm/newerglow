@@ -11,6 +11,54 @@ use std::time::{Duration, Instant};
 /// `RP2350`. Both take the same UF2 flash flow.
 const VOLUME_LABELS: &[&str] = &["RPI-RP2", "RP2350"];
 
+/// Which bootrom is mounted, and so which UF2 families it will write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chip {
+    Rp2040,
+    Rp2350,
+}
+
+impl Chip {
+    pub fn name(self) -> &'static str {
+        match self {
+            Chip::Rp2040 => "RP2040",
+            Chip::Rp2350 => "RP2350",
+        }
+    }
+
+    /// Whether this chip's bootrom writes blocks of UF2 family `id`.
+    pub fn accepts_family(self, id: u32) -> bool {
+        match self {
+            Chip::Rp2040 => id == 0xE48B_FF56,
+            // absolute, ARM secure, RISC-V, ARM non-secure. Absolute is an
+            // RP2350-bootrom addition; the RP2040 bootrom ignores it.
+            Chip::Rp2350 => matches!(id, 0xE48B_FF57 | 0xE48B_FF59 | 0xE48B_FF5A | 0xE48B_FF5B),
+        }
+    }
+
+    fn from_label(label: &str) -> Option<Chip> {
+        match label.trim() {
+            "RPI-RP2" => Some(Chip::Rp2040),
+            "RP2350" => Some(Chip::Rp2350),
+            _ => None,
+        }
+    }
+}
+
+/// Which chip's bootloader is mounted at `volume`: the `Board-ID:` line of
+/// the bootrom's INFO_UF2.TXT, else the volume's own name. The file is the
+/// primary source because a Windows drive root (`E:\`) has no name to read.
+pub fn chip(volume: &std::path::Path) -> Option<Chip> {
+    let from_info = std::fs::read_to_string(volume.join("INFO_UF2.TXT"))
+        .ok()
+        .and_then(|info| {
+            info.lines()
+                .find_map(|l| l.strip_prefix("Board-ID:"))
+                .and_then(Chip::from_label)
+        });
+    from_info.or_else(|| volume.file_name()?.to_str().and_then(Chip::from_label))
+}
+
 /// Accept `path` only if it is a real directory (not a symlink that could
 /// redirect the flash) whose basename is a known bootloader label.
 ///
@@ -143,6 +191,23 @@ mod tests {
         // RP2040 mounts as RPI-RP2, RP2350 as RP2350; both must be accepted.
         assert!(VOLUME_LABELS.contains(&"RPI-RP2"));
         assert!(VOLUME_LABELS.contains(&"RP2350"));
+    }
+
+    #[test]
+    fn chip_from_info_uf2_board_id() {
+        let dir = std::env::temp_dir().join(format!("newerglow-vol-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("INFO_UF2.TXT"),
+            "UF2 Bootloader v1.0\r\nModel: Raspberry Pi RP2350\r\nBoard-ID: RP2350\r\n",
+        )
+        .unwrap();
+        assert_eq!(super::chip(&dir), Some(super::Chip::Rp2350));
+        std::fs::write(dir.join("INFO_UF2.TXT"), "Model: Raspberry Pi RP2\nBoard-ID: RPI-RP2\n").unwrap();
+        assert_eq!(super::chip(&dir), Some(super::Chip::Rp2040));
+        std::fs::remove_file(dir.join("INFO_UF2.TXT")).unwrap();
+        assert_eq!(super::chip(&dir), None, "no INFO_UF2.TXT and an unrecognized name");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

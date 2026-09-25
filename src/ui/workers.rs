@@ -78,9 +78,21 @@ fn mock_identify(port: &str, registry: &Registry) -> Option<String> {
     let id = port.strip_prefix(MOCK_BLINK_PREFIX)?;
     let board = registry.get(id)?;
     Some(format!(
-        "{} v0.9.0 hw=v5 sn=MOCKDEADBEEF",
-        board.manifest.identity.prefix
+        "{} v0.9.0{} sn=MOCKDEADBEEF",
+        board.manifest.identity.prefix,
+        mock_hw_token()
     ))
+}
+
+/// `hw=` token for mock identities, from NEWERGLOW_MOCK_HW: unset gives
+/// `hw=5`, empty leaves the token out (a device of unknown revision), any
+/// other value is used as the revision.
+fn mock_hw_token() -> String {
+    match std::env::var("NEWERGLOW_MOCK_HW") {
+        Err(_) => " hw=5".to_string(),
+        Ok(hw) if hw.is_empty() => String::new(),
+        Ok(hw) => format!(" hw={hw}"),
+    }
 }
 
 /// Events emitted by background workers, consumed by the UI thread.
@@ -122,12 +134,15 @@ pub enum FirmwareSource {
     /// File already on disk; no download needed.
     Local(PathBuf),
     /// Need to download. The destination cache path is computed from
-    /// (owner, repo, tag) by the worker. `size` and `digest` come from the
+    /// (owner, repo, tag, asset) by the worker. `size` and `digest` come from the
     /// GitHub asset metadata and are used to validate the download.
     Remote {
         owner: String,
         repo: String,
         tag: String,
+        /// Asset file name. Part of the cache key: one release carries an
+        /// asset per hardware revision.
+        asset: String,
         url: String,
         /// Expected byte length from the GitHub asset (0 if unknown).
         size: u64,
@@ -267,12 +282,13 @@ fn run_update(
             owner,
             repo,
             tag,
+            asset,
             url,
             size,
             digest,
         } => {
             emit(tx, ctx, Event::UpdateProgress(UpdatePhase::Downloading));
-            download_cached(&owner, &repo, &tag, &url, size, digest.as_deref())?
+            download_cached(&owner, &repo, &tag, &asset, &url, size, digest.as_deref())?
         }
     };
 
@@ -321,6 +337,7 @@ fn download_cached(
     owner: &str,
     repo: &str,
     tag: &str,
+    asset: &str,
     url: &str,
     expected_size: u64,
     expected_digest: Option<&str>,
@@ -332,12 +349,14 @@ fn download_cached(
         .join(format!("{}_{}", owner, repo));
     std::fs::create_dir_all(&cache_root)?;
 
-    // Sanitize the tag for filesystem safety
-    let safe_tag: String = tag
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
-        .collect();
-    let dest = cache_root.join(format!("{}.uf2", safe_tag));
+    // Sanitize the tag and asset name for filesystem safety
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect()
+    };
+    let asset_stem = asset.strip_suffix(".uf2").unwrap_or(asset);
+    let dest = cache_root.join(format!("{}__{}.uf2", safe(tag), safe(asset_stem)));
 
     if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 0)
         && cached_file_matches(&dest, expected_size, expected_digest)

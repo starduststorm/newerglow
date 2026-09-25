@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::boards::Registry;
 use crate::device::DeviceInfo;
 use crate::ui::board_assets;
-use crate::ui::github::Release;
+use crate::ui::github::{self, Offer, Release};
 use crate::ui::model::{ModelRenderer, SharedModel};
 use crate::ui::workers::{self, Event, FirmwareSource, UpdatePhase};
 use crate::ui::{card, desired_inner_width, CARD_WIDTH};
@@ -38,12 +38,16 @@ impl ReleaseLibrary {
 /// Per-device firmware selection.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FirmwareSelection {
-    /// Default: no explicit pick. UI auto-selects newest release of the
-    /// matched project (if any).
+    /// Default: no explicit pick. UI auto-selects the newest release of the
+    /// matched project that has an asset for the device's hardware revision.
     #[default]
     Auto,
-    /// User picked a specific release from the dropdown.
-    Release { board_id: String, release_idx: usize },
+    /// User picked a specific release, and the asset in it, from the dropdown.
+    Release {
+        board_id: String,
+        release_idx: usize,
+        asset: String,
+    },
     /// User picked a local UF2 file.
     Local(PathBuf),
 }
@@ -71,6 +75,49 @@ impl DeviceCard {
     pub fn port_name(&self) -> &str {
         &self.info.port_name
     }
+
+    /// The device's hardware revision as it applies to `board_id`'s
+    /// releases: only a device identified as that board speaks for it.
+    pub fn hw_for(&self, board_id: &str) -> Option<&str> {
+        if self.matched_board.as_deref() != Some(board_id) {
+            return None;
+        }
+        self.parsed
+            .as_ref()?
+            .hw_version
+            .as_deref()
+            .filter(|hw| github::usable_hw(hw))
+    }
+}
+
+/// What `device` may flash from `board_id`'s releases, newest first. Empty
+/// until that board's releases are loaded.
+pub fn device_offers<'a>(
+    device: &DeviceCard,
+    registry: &Registry,
+    library: &'a ReleaseLibrary,
+    board_id: &str,
+) -> Vec<Offer<'a>> {
+    let (Some(board), Some(BoardReleases::Loaded(releases))) =
+        (registry.get(board_id), library.get(board_id))
+    else {
+        return Vec::new();
+    };
+    github::offers(releases, &board.manifest.firmware.asset_pattern, device.hw_for(board_id))
+}
+
+/// The offer `FirmwareSelection::Auto` resolves to, if any.
+pub fn auto_offer<'a>(
+    device: &DeviceCard,
+    registry: &Registry,
+    library: &'a ReleaseLibrary,
+) -> Option<Offer<'a>> {
+    let board_id = device.matched_board.as_deref()?;
+    let board = registry.get(board_id)?;
+    let BoardReleases::Loaded(releases) = library.get(board_id)? else {
+        return None;
+    };
+    github::auto_offer(releases, &board.manifest.firmware.asset_pattern, device.hw_for(board_id))
 }
 
 pub enum UpdateState {
@@ -436,31 +483,35 @@ impl App {
             FirmwareSelection::Release {
                 board_id,
                 release_idx,
-            } => self.source_from_release(board_id, *release_idx),
+                asset,
+            } => {
+                let release = match self.library.get(board_id)? {
+                    BoardReleases::Loaded(rs) => rs.get(*release_idx)?,
+                    _ => return None,
+                };
+                let asset = release.assets.iter().find(|a| &a.name == asset)?;
+                self.remote_source(board_id, release, asset)
+            }
             FirmwareSelection::Auto => {
-                let board_id = device.matched_board.as_deref()?;
-                self.source_from_release(board_id, 0)
+                let offer = auto_offer(device, &self.registry, &self.library)?;
+                self.remote_source(device.matched_board.as_deref()?, offer.release, offer.asset)
             }
         }
     }
 
-    fn source_from_release(
+    fn remote_source(
         &self,
         board_id: &str,
-        idx: usize,
+        release: &Release,
+        asset: &github::Asset,
     ) -> Option<(FirmwareSource, String)> {
         let fw = &self.registry.get(board_id)?.manifest.firmware;
-        let releases = match self.library.get(board_id)? {
-            BoardReleases::Loaded(rs) => rs,
-            _ => return None,
-        };
-        let release = releases.get(idx)?;
-        let asset = release.matching_asset(&fw.asset_pattern)?;
         Some((
             FirmwareSource::Remote {
                 owner: fw.github_owner.clone(),
                 repo: fw.github_repo.clone(),
                 tag: release.tag_name.clone(),
+                asset: asset.name.clone(),
                 url: asset.browser_download_url.clone(),
                 size: asset.size,
                 digest: asset.digest.clone(),
@@ -724,6 +775,7 @@ impl App {
                         ref port_name,
                         ref board_id,
                         idx,
+                        ref asset,
                     } => {
                         if let Some(d) =
                             self.devices.iter_mut().find(|d| d.port_name() == port_name)
@@ -731,6 +783,7 @@ impl App {
                             d.selection = FirmwareSelection::Release {
                                 board_id: board_id.clone(),
                                 release_idx: idx,
+                                asset: asset.clone(),
                             };
                         }
                     }

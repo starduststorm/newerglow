@@ -1,9 +1,9 @@
-use globset::Glob;
+use globset::{Glob, GlobMatcher};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::boards::Board;
+use crate::boards::{Board, HW_PLACEHOLDER};
 
 /// Build a ureq Agent with native-tls wired up. ureq's free functions
 /// (`ureq::get(...)`) use a default Agent that doesn't know about native-tls
@@ -114,9 +114,10 @@ pub fn fetch_releases(board: &Board) -> Result<Vec<Release>, FetchError> {
         .into_json()
         .map_err(|e| FetchError::Parse(e.to_string()))?;
 
-    let glob = Glob::new(&fw.asset_pattern)
-        .map_err(|e| FetchError::Parse(format!("bad asset_pattern: {}", e)))?
-        .compile_matcher();
+    // Board-level filter: an asset for any hardware revision keeps the
+    // release; which revision a device may use is decided per device.
+    let glob = asset_matcher(&fw.asset_pattern, None)
+        .map_err(|e| FetchError::Parse(format!("bad asset_pattern: {}", e)))?;
 
     // Filter to non-draft releases that (a) have an asset matching the
     // board's pattern AND (b) carry a version-parseable tag. The version
@@ -190,17 +191,100 @@ impl Release {
             _ => primary.to_string(),
         }
     }
+}
 
-    /// Pick the first asset matching the board's pattern.
-    pub fn matching_asset(&self, pattern: &str) -> Option<&Asset> {
-        let glob = Glob::new(pattern).ok()?.compile_matcher();
-        self.assets.iter().find(|a| glob.is_match(&a.name))
+/// Compile `pattern` for one hardware revision, or for any (non-empty)
+/// revision when `hw` is None. Without a `{hw}` placeholder, `hw` changes
+/// nothing.
+pub fn asset_matcher(pattern: &str, hw: Option<&str>) -> Result<GlobMatcher, globset::Error> {
+    let pattern = pattern.replace(HW_PLACEHOLDER, hw.unwrap_or("?*"));
+    Ok(Glob::new(&pattern)?.compile_matcher())
+}
+
+/// A device-reported revision usable in a glob: the contract allows
+/// `[a-z0-9]+`, and anything carrying glob syntax (`*`, `[`, `{`) must not
+/// reach the pattern, since IDENTIFY output is untrusted.
+pub fn usable_hw(hw: &str) -> bool {
+    !hw.is_empty() && hw.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// The revision an asset name was published for, i.e. what `{hw}` stands
+/// for in it. None when the pattern has no placeholder or doesn't match.
+fn captured_hw(pattern: &str, name: &str) -> Option<String> {
+    let (pre, post) = pattern.split_once(HW_PLACEHOLDER)?;
+    let pre = Glob::new(pre).ok()?.compile_matcher();
+    let post = Glob::new(post).ok()?.compile_matcher();
+    // Earliest start and latest end: the longest capture, so `hw{hw}.uf2`
+    // against "x-hwmini2.uf2" reads "mini2", not "2".
+    for start in (0..=name.len()).filter(|&i| name.is_char_boundary(i)) {
+        if !pre.is_match(&name[..start]) {
+            continue;
+        }
+        for end in (start + 1..=name.len()).rev().filter(|&i| name.is_char_boundary(i)) {
+            let hw = &name[start..end];
+            if usable_hw(hw) && post.is_match(&name[end..]) {
+                return Some(hw.to_string());
+            }
+        }
     }
+    None
+}
+
+/// One flashable choice for a device: a release and the asset in it.
+#[derive(Clone, Debug)]
+pub struct Offer<'a> {
+    pub release_idx: usize,
+    pub release: &'a Release,
+    pub asset: &'a Asset,
+    pub label: String,
+}
+
+/// What a device may flash from a board's releases, newest first.
+///
+/// With a `{hw}` pattern and a known revision, each release offers its asset
+/// for that revision, and releases without one aren't offered at all. With
+/// the revision unknown, every revision's asset is offered, labeled with the
+/// revision it was built for, so the user can choose. Without a placeholder
+/// each release offers its first matching asset.
+pub fn offers<'a>(releases: &'a [Release], pattern: &str, hw: Option<&str>) -> Vec<Offer<'a>> {
+    let per_revision = pattern.contains(HW_PLACEHOLDER) && hw.is_none();
+    let Ok(glob) = asset_matcher(pattern, hw) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (release_idx, release) in releases.iter().enumerate() {
+        let mut matching = release.assets.iter().filter(|a| glob.is_match(&a.name));
+        if per_revision {
+            for asset in matching {
+                let label = match captured_hw(pattern, &asset.name) {
+                    Some(hw) => format!("{} · hw {}", release.display_label(), hw),
+                    None => format!("{} · {}", release.display_label(), asset.name),
+                };
+                out.push(Offer { release_idx, release, asset, label });
+            }
+        } else if let Some(asset) = matching.next() {
+            out.push(Offer { release_idx, release, asset, label: release.display_label() });
+        }
+    }
+    out
+}
+
+/// The release `Auto` picks for a device: the newest offer, except when the
+/// board publishes per revision and the device's revision is unknown, where
+/// guessing could hand it another board's image.
+pub fn auto_offer<'a>(releases: &'a [Release], pattern: &str, hw: Option<&str>) -> Option<Offer<'a>> {
+    if pattern.contains(HW_PLACEHOLDER) && hw.is_none() {
+        return None;
+    }
+    offers(releases, pattern, hw).into_iter().next()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_release_version, require_https, FetchError};
+    use super::{
+        asset_matcher, auto_offer, captured_hw, offers, parse_release_version, require_https,
+        Asset, FetchError, Release,
+    };
 
     #[test]
     fn require_https_accepts_https() {
@@ -275,5 +359,99 @@ mod tests {
                 "fw-v1.2",        // shorter loses on ties (1.2 < 1.2.3)
             ]
         );
+    }
+
+    fn release(tag: &str, assets: &[&str]) -> Release {
+        Release {
+            tag_name: tag.to_string(),
+            name: None,
+            html_url: String::new(),
+            published_at: None,
+            draft: false,
+            assets: assets
+                .iter()
+                .map(|n| Asset {
+                    name: n.to_string(),
+                    browser_download_url: format!("https://example.invalid/{n}"),
+                    size: 0,
+                    digest: None,
+                })
+                .collect(),
+        }
+    }
+
+    const HEXA: &str = "motionhexa-*-hw{hw}.uf2";
+
+    fn hexa_releases() -> Vec<Release> {
+        vec![
+            release("fw-v1.4", &["motionhexa-1.4-hw7.uf2", "motionhexa-1.4-hw8.uf2"]),
+            release(
+                "fw-v1.3",
+                &["motionhexa-1.3-hw5.uf2", "motionhexa-1.3-hw6.uf2", "motionhexa-1.3-hw7.uf2", "motionhexa-1.3-hw8.uf2"],
+            ),
+            release("fw-v1.2", &["firmware-v5.uf2"]),
+        ]
+    }
+
+    #[test]
+    fn known_hw_is_offered_only_releases_with_its_asset() {
+        let rs = hexa_releases();
+        let v5: Vec<_> = offers(&rs, HEXA, Some("5")).iter().map(|o| o.asset.name.clone()).collect();
+        assert_eq!(v5, ["motionhexa-1.3-hw5.uf2"]);
+        let v8: Vec<_> = offers(&rs, HEXA, Some("8")).iter().map(|o| o.release_idx).collect();
+        assert_eq!(v8, [0, 1]);
+        assert!(offers(&rs, HEXA, Some("9")).is_empty());
+    }
+
+    #[test]
+    fn auto_is_newest_eligible_not_newest_overall() {
+        let rs = hexa_releases();
+        let auto = auto_offer(&rs, HEXA, Some("6")).unwrap();
+        assert_eq!(auto.release_idx, 1);
+        assert_eq!(auto.asset.name, "motionhexa-1.3-hw6.uf2");
+    }
+
+    #[test]
+    fn unknown_hw_lists_every_revision_and_never_auto_picks() {
+        let rs = hexa_releases();
+        let labels: Vec<_> = offers(&rs, HEXA, None).into_iter().map(|o| o.label).collect();
+        assert_eq!(
+            labels,
+            ["fw-v1.4 · hw 7", "fw-v1.4 · hw 8", "fw-v1.3 · hw 5", "fw-v1.3 · hw 6", "fw-v1.3 · hw 7", "fw-v1.3 · hw 8"]
+        );
+        assert!(auto_offer(&rs, HEXA, None).is_none());
+    }
+
+    #[test]
+    fn pattern_without_placeholder_keeps_first_match_behavior() {
+        let rs = vec![release("fw-v1.2", &["notes.txt", "firmware-v5.uf2", "other.uf2"])];
+        let auto = auto_offer(&rs, "*.uf2", None).unwrap();
+        assert_eq!(auto.asset.name, "firmware-v5.uf2");
+        assert_eq!(offers(&rs, "*.uf2", Some("7")).len(), 1, "hw is ignored without {{hw}}");
+    }
+
+    #[test]
+    fn placeholder_is_not_left_to_glob_alternation() {
+        // Unsubstituted, globset would read `{hw}` as the literal "hw".
+        let any = asset_matcher(HEXA, None).unwrap();
+        assert!(any.is_match("motionhexa-1.3-hw7.uf2"));
+        assert!(!any.is_match("motionhexa-1.3-hw.uf2"));
+        assert!(!asset_matcher(HEXA, Some("7")).unwrap().is_match("motionhexa-1.3-hwhw.uf2"));
+    }
+
+    #[test]
+    fn captures_the_whole_revision() {
+        assert_eq!(captured_hw(HEXA, "motionhexa-1.3-hwmini2.uf2").as_deref(), Some("mini2"));
+        assert_eq!(captured_hw(HEXA, "motionhexa-1.4-rc1-hw7.uf2").as_deref(), Some("7"));
+        assert_eq!(captured_hw("*.uf2", "a.uf2"), None);
+    }
+
+    #[test]
+    fn embedded_patterns_compile_for_any_and_one_revision() {
+        for board in crate::boards::Registry::load().boards() {
+            let pattern = &board.manifest.firmware.asset_pattern;
+            assert!(asset_matcher(pattern, None).is_ok(), "{}: {pattern}", board.id);
+            assert!(asset_matcher(pattern, Some("7")).is_ok(), "{}: {pattern}", board.id);
+        }
     }
 }

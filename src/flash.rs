@@ -1,12 +1,19 @@
 use crate::error::UpdateError;
+use crate::{uf2, volume};
 use log::debug;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Copy a UF2 firmware file to the bootloader volume. The bootloader
 /// reboots the device itself once the write completes.
+/// Refuses, before writing anything, a UF2 built for the other chip.
 pub fn flash_firmware(volume: &Path, firmware_path: &Path) -> Result<(), UpdateError> {
     let dest = resolve_dest(volume, firmware_path)?;
+
+    match volume::chip(volume) {
+        Some(chip) => uf2::check_family(firmware_path, chip)?,
+        None => debug!("can't tell which chip {} belongs to; skipping UF2 family check", volume.display()),
+    }
 
     debug!(
         "copying {} to {}",

@@ -8,6 +8,9 @@ use log::warn;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+/// Placeholder in `Firmware::asset_pattern` for the device's hardware revision.
+pub const HW_PLACEHOLDER: &str = "{hw}";
+
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/boards_generated.rs"));
 }
@@ -41,6 +44,9 @@ pub struct Identity {
 pub struct Firmware {
     pub github_owner: String,
     pub github_repo: String,
+    /// Glob matched against release asset names. May contain `{hw}` once,
+    /// standing for the device's IDENTIFY `hw=` revision (see
+    /// `doc/firmware-release-contract.md`).
     pub asset_pattern: String,
     /// Release tags must start with this; the remainder (minus one optional
     /// leading `v`) parses as the version. Empty accepts `v1.2.3` and `1.2.3`.
@@ -187,6 +193,9 @@ fn parse_manifest(src: &str) -> Result<BoardManifest, String> {
     let manifest: BoardManifest = toml::from_str(src).map_err(|e| e.to_string())?;
     if manifest.identity.usb_vid.is_empty() {
         return Err("identity.usb_vid must list at least one vendor id".to_string());
+    }
+    if manifest.firmware.asset_pattern.matches(HW_PLACEHOLDER).count() > 1 {
+        return Err(format!("firmware.asset_pattern may contain {HW_PLACEHOLDER} at most once"));
     }
     Ok(manifest)
 }
@@ -454,6 +463,22 @@ github_repo = "r"
 asset_pattern = "*.uf2"
 "#;
         assert!(parse_manifest(src).is_err());
+    }
+
+    #[test]
+    fn manifest_rejects_repeated_hw_placeholder() {
+        let src = r#"
+display_name = "x"
+[identity]
+prefix = "x"
+usb_vid = [1]
+[firmware]
+github_owner = "o"
+github_repo = "r"
+asset_pattern = "x-{hw}-hw{hw}.uf2"
+"#;
+        assert!(parse_manifest(src).is_err());
+        assert!(parse_manifest(&src.replace("x-{hw}-", "x-*-")).is_ok());
     }
 
     #[test]

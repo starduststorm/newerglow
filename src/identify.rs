@@ -111,8 +111,8 @@ mod tests {
 
     #[test]
     fn passes_through_normal_identity() {
-        let s = sanitize_identity("motionhexa v0.9.0 hw=v5 sn=DEADBEEF");
-        assert_eq!(s, "motionhexa v0.9.0 hw=v5 sn=DEADBEEF");
+        let s = sanitize_identity("motionhexa v0.9.0 hw=5 sn=DEADBEEF");
+        assert_eq!(s, "motionhexa v0.9.0 hw=5 sn=DEADBEEF");
     }
 
     #[test]

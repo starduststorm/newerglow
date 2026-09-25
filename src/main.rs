@@ -294,6 +294,10 @@ fn print_troubleshooting(err: &UpdateError) {
         UpdateError::MultipleVolumes => Some(
             "Disconnect all but one device in BOOTSEL mode and try again."
         ),
+        UpdateError::WrongChip { .. } => Some(
+            "Nothing was written. The device is still in bootloader mode; unplug and replug it,\n\
+             then run this tool again with the .uf2 built for its hardware revision."
+        ),
         UpdateError::FlashFailed(_) => Some(
             "The firmware file could not be written to the device.\n\
              Try unplugging the device, re-entering BOOTSEL mode, and running this tool again."

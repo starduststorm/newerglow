@@ -1,0 +1,12 @@
+display_name = "penta"
+
+[identity]
+prefix = "penta"
+usb_vid = [0x2E8A]
+usb_pid = []
+
+[firmware]
+github_owner = "starduststorm"
+github_repo = "penta"
+asset_pattern = "penta-*-hw{hw}.uf2"
+tag_prefix = "fw-v"

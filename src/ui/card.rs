@@ -1,7 +1,8 @@
 use eframe::egui;
 
 use crate::boards::Registry;
-use crate::ui::app::{BoardReleases, DeviceCard, FirmwareSelection, ReleaseLibrary};
+use crate::boards::HW_PLACEHOLDER;
+use crate::ui::app::{self, BoardReleases, DeviceCard, FirmwareSelection, ReleaseLibrary};
 use crate::ui::model::SharedModel;
 use crate::ui::workers::UpdatePhase;
 use crate::ui::{CARD_WIDTH, IMAGE_HEIGHT, IMAGE_SIDE};
@@ -25,6 +26,7 @@ pub enum Action {
         port_name: String,
         board_id: String,
         idx: usize,
+        asset: String,
     },
     ClearLocal(String), // port_name
 }
@@ -494,20 +496,26 @@ fn draw_dropdown(ui: &mut egui::Ui, ctx: &DrawContext, width: f32) -> Action {
         FirmwareSelection::Release {
             board_id,
             release_idx,
+            asset,
         } => match ctx.library.get(board_id) {
-            Some(BoardReleases::Loaded(rs)) => rs
-                .get(*release_idx)
-                .map(|r| r.display_label())
-                .unwrap_or_else(|| "(invalid)".to_string()),
+            Some(BoardReleases::Loaded(_)) => {
+                app::device_offers(device, ctx.registry, ctx.library, board_id)
+                    .into_iter()
+                    .find(|o| o.release_idx == *release_idx && &o.asset.name == asset)
+                    .map(|o| o.label)
+                    .unwrap_or_else(|| "(invalid)".to_string())
+            }
             _ => "(loading…)".to_string(),
         },
         FirmwareSelection::Auto => match &device.matched_board {
             Some(id) => match ctx.library.get(id) {
                 Some(BoardReleases::Loading) => "Loading…".to_string(),
-                Some(BoardReleases::Loaded(rs)) => rs
-                    .first()
-                    .map(|r| r.display_label())
-                    .unwrap_or_else(|| "(no releases)".to_string()),
+                Some(BoardReleases::Loaded(_)) => {
+                    match app::auto_offer(device, ctx.registry, ctx.library) {
+                        Some(offer) => offer.label,
+                        None => no_auto_text(ctx, id),
+                    }
+                }
                 Some(BoardReleases::Failed(e)) => format!("⚠ {}", short_err(e)),
                 None => "—".to_string(),
             },
@@ -588,17 +596,23 @@ fn draw_board_entries(
                 ),
             );
         }
-        Some(BoardReleases::Loaded(releases)) => {
-            for (i, r) in releases.iter().enumerate() {
+        Some(BoardReleases::Loaded(_)) => {
+            let offers = app::device_offers(ctx.device, ctx.registry, ctx.library, board_id);
+            if offers.is_empty() {
+                ui.add_enabled(false, egui::Label::new(no_offers_text(ctx, board_id)));
+            }
+            for offer in offers {
                 let selected = matches!(
                     &ctx.device.selection,
-                    FirmwareSelection::Release { board_id: bid, release_idx } if bid == board_id && *release_idx == i
+                    FirmwareSelection::Release { board_id: bid, release_idx, asset }
+                        if bid == board_id && *release_idx == offer.release_idx && *asset == offer.asset.name
                 );
-                if ui.selectable_label(selected, r.display_label()).clicked() {
+                if ui.selectable_label(selected, offer.label).clicked() {
                     *action = Action::SelectRelease {
                         port_name: ctx.device.port_name().to_string(),
                         board_id: board_id.to_string(),
-                        idx: i,
+                        idx: offer.release_idx,
+                        asset: offer.asset.name.clone(),
                     };
                 }
             }
@@ -607,6 +621,30 @@ fn draw_board_entries(
             ui.add_enabled(false, egui::Label::new("(not loaded)"));
         }
     }
+}
+
+/// Dropdown text when `Auto` finds nothing in a loaded release list: the
+/// device's revision is unknown and the user must choose, or nothing fits.
+fn no_auto_text(ctx: &DrawContext, board_id: &str) -> String {
+    if per_revision(ctx, board_id) && ctx.device.hw_for(board_id).is_none() {
+        return "Pick firmware…".to_string();
+    }
+    no_offers_text(ctx, board_id)
+}
+
+/// Placeholder for a board whose loaded releases offer this device nothing.
+fn no_offers_text(ctx: &DrawContext, board_id: &str) -> String {
+    match ctx.device.hw_for(board_id) {
+        Some(hw) if per_revision(ctx, board_id) => format!("(none for hw {hw})"),
+        _ => "(no releases)".to_string(),
+    }
+}
+
+/// Whether `board_id` publishes an asset per hardware revision.
+fn per_revision(ctx: &DrawContext, board_id: &str) -> bool {
+    ctx.registry
+        .get(board_id)
+        .is_some_and(|b| b.manifest.firmware.asset_pattern.contains(HW_PLACEHOLDER))
 }
 
 /// Truncate to ~40 characters for use inside the dropdown popup.
