@@ -1,6 +1,6 @@
 # Newer Glow
 
-Cross-platform firmware updater for RP2040/RP2350 devices, primed for starduststorm led artwork.
+Cross-platform firmware updater starduststorm device updates, and generically for RP2040/RP2350 devices.
 
 Download the app on the [releases page](../../releases) or build and run headless.
 
